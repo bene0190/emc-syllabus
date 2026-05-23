@@ -566,14 +566,23 @@ body.dark .flowchart-stage { background:#f8fafc; }
       el.chips.appendChild(btn);
     });
   }
+  function findFallbackItem(item) {
+    const itemCode = norm(item && item.code);
+    const itemId = item && item.id;
+    return fallbackChecklist.find(fallback => norm(fallback.code) === itemCode || fallback.id === itemId) || {};
+  }
   function urlFrom(item, keys) {
-    for (const key of keys) {
-      const value = String(item[key] || '').trim();
-      if (/^https?:\/\//i.test(value)) return value;
+    const candidates = [];
+    for (const key of keys) candidates.push(String(item?.[key] || '').trim());
+    const fallback = findFallbackItem(item);
+    for (const key of keys) candidates.push(String(fallback?.[key] || '').trim());
+    for (const value of candidates) {
+      const match = value.match(/https?:\/\/[^\s"'<>]+/i);
+      if (match) return match[0];
     }
     return '';
   }
-  function syllabusUrl(item) { return urlFrom(item, ['syllabus-url','syllabus-link-document']); }
+  function syllabusUrl(item) { return urlFrom(item, ['syllabus-url','syllabus-link-document','link','url']); }
   function programLabel(item) {
     const raw = (item.program || '').trim();
     if (!raw) return '—';
