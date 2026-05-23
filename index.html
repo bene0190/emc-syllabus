@@ -68,6 +68,11 @@ a:hover { text-decoration:underline; }
 .week b { color:var(--brand); }
 mark { background:var(--mark); color:var(--ink); border-radius:4px; padding:0 2px; }
 .empty { padding:40px; text-align:center; color:var(--muted); }
+.sheet-status { max-width:1220px; margin:-10px auto 18px; padding:0 24px; color:var(--muted); font-size:13px; }
+.sheet-status .sheet-status-box { display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line); background:var(--card); border-radius:999px; padding:9px 13px; box-shadow:0 4px 16px rgba(15,23,42,.05); }
+.sheet-status b { color:var(--brand); }
+.sheet-status .ok { color:var(--good); font-weight:900; }
+.sheet-status .warn { color:var(--bad); font-weight:900; }
 footer { max-width:1220px; margin:0 auto 30px; padding:0 24px; color:var(--muted); font-size:13px; }
 
 .flowchart-card { padding:16px; }
@@ -117,6 +122,7 @@ body.dark .flowchart-stage { background:#f8fafc; }
   <select id="areaFilter"><option value="all">All curriculum areas</option></select>
   <button id="flowchartButton" type="button">Show Flowchart</button>
 </section>
+<div id="sheetStatus" class="sheet-status"><span class="sheet-status-box"><span class="ok">●</span><b>Checking Google Sheet connection…</b></span></div>
 
 <main class="wrap">
   <aside class="panel">
@@ -140,7 +146,11 @@ body.dark .flowchart-stage { background:#f8fafc; }
 'use strict';
 (function() {
   const data = JSON.parse(document.getElementById('app-data').textContent);
-  const checklist = Array.isArray(data.checklist) ? data.checklist : [];
+  const fallbackChecklist = Array.isArray(data.checklist) ? data.checklist : [];
+  let checklist = fallbackChecklist.slice();
+  const SHEET_ID = '1oYvJns3vUYeaaG1uBnOReUtUBijQzi5G0zjP17OaSjA';
+  const SHEET_GVIZ_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=responseHandler:__emcSheetLoaded;out:json&headers=1`;
+  const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
   const savedKey = 'emc-syllabus-checks-v2';
   const themeKey = 'emc-syllabus-theme-v2';
   let checks = JSON.parse(localStorage.getItem(savedKey) || '{}');
@@ -155,7 +165,8 @@ body.dark .flowchart-stage { background:#f8fafc; }
     chips: document.getElementById('areaChips'),
     cards: document.getElementById('courseCards'),
     theme: document.getElementById('darkModeToggle'),
-    flowchart: document.getElementById('flowchartButton')
+    flowchart: document.getElementById('flowchartButton'),
+    sheetStatus: document.getElementById('sheetStatus')
   };
 
   function esc(value) {
@@ -170,6 +181,171 @@ body.dark .flowchart-stage { background:#f8fafc; }
     return '';
   }
   function unique(list) { return [...new Set(list.filter(Boolean))].sort(); }
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], value = '', quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i], next = text[i + 1];
+      if (quoted) {
+        if (char === '"' && next === '"') { value += '"'; i++; }
+        else if (char === '"') quoted = false;
+        else value += char;
+      } else {
+        if (char === '"') quoted = true;
+        else if (char === ',') { row.push(value); value = ''; }
+        else if (char === '\n') { row.push(value); rows.push(row); row = []; value = ''; }
+        else if (char !== '\r') value += char;
+      }
+    }
+    row.push(value);
+    rows.push(row);
+    return rows.filter(r => r.some(cell => String(cell).trim() !== ''));
+  }
+  function slug(value) {
+    return norm(value).replace(/\s+/g, '-');
+  }
+  function headerKey(value) {
+    return norm(value).replace(/\s+/g, '-');
+  }
+  function valueFrom(row, keys) {
+    for (const key of keys) {
+      const found = row[key];
+      if (found != null && String(found).trim() !== '') return String(found).trim();
+    }
+    return '';
+  }
+  function normalizeSheetRow(row) {
+    const code = valueFrom(row, ['code','course-code','course-no','course-number','subject-code']);
+    const subject = valueFrom(row, ['subject','course-title','title','course-name','description-title']);
+    if (!code && !subject) return null;
+    const id = slug(code || subject);
+    const existing = fallbackChecklist.find(item => norm(item.code) === norm(code) || item.id === id) || {};
+    const year = valueFrom(row, ['school-year-term','year','year-level','school-year','year-term']) || existing['school-year-term'] || '';
+    const term = valueFrom(row, ['blank','term','semester','trimester']) || existing.blank || '';
+    const statusRaw = valueFrom(row, ['status','syllabus-status','complete','completion-status']) || existing.status || '';
+    const isComplete = /^(true|yes|y|complete|✓ complete|done)$/i.test(statusRaw) || /complete/i.test(statusRaw) && !/incomplete/i.test(statusRaw);
+    const description = valueFrom(row, ['description','course-description']) || existing.courseDetail?.description || '';
+    const prerequisites = valueFrom(row, ['prerequisites','prerequisite','pre-requisites','pre-requisite']) || existing.prerequisites || existing.courseDetail?.prerequisites || '';
+    const weeks = [];
+    for (let i = 1; i <= 13; i++) {
+      const formative = valueFrom(row, [`week-${i}`,`week${i}`,`week-${i}-formative`,`week${i}-formative`,`week-${i}-topic`,`week${i}-topic`]);
+      const weekDesc = valueFrom(row, [`week-${i}-description`,`week${i}-description`,`week-${i}-desc`,`week${i}-desc`]);
+      if (formative || weekDesc) weeks.push({ week: `Week ${i}`, formative: formative || '—', description: weekDesc });
+    }
+    return {
+      ...existing,
+      'curriculum-area': valueFrom(row, ['curriculum-area','area','category']) || existing['curriculum-area'] || '',
+      code: code || existing.code || '',
+      subject: subject || existing.subject || '',
+      status: statusRaw || (isComplete ? '✓ Complete' : 'Incomplete'),
+      program: valueFrom(row, ['program','track','program-track']) || existing.program || '',
+      prerequisites,
+      'school-year-term': year,
+      blank: term,
+      'suggested-output-activity-type': valueFrom(row, ['suggested-output-activity-type','output-activity-type','activity-type']) || existing['suggested-output-activity-type'] || '',
+      'blank-2': valueFrom(row, ['blank-2','suggested-output','output','final-output']) || existing['blank-2'] || '',
+      midterm: valueFrom(row, ['midterm','midterm-url','sample-midterm','sample-midterm-url']) || existing.midterm || '',
+      finals: valueFrom(row, ['finals','final','finals-url','sample-finals','sample-finals-url']) || existing.finals || '',
+      id,
+      isComplete,
+      courseDetail: (description || prerequisites || weeks.length || existing.courseDetail) ? {
+        ...(existing.courseDetail || {}),
+        sheet: code || existing.courseDetail?.sheet || '',
+        code: code || existing.courseDetail?.code || '',
+        title: code && subject ? `${code} - ${subject}` : (subject || existing.courseDetail?.title || ''),
+        prerequisites,
+        description,
+        weeks: weeks.length ? weeks : (existing.courseDetail?.weeks || [])
+      } : null,
+      'syllabus-url': valueFrom(row, ['syllabus-url','syllabus-link','syllabus-link-document','link','url']) || existing['syllabus-url'] || ''
+    };
+  }
+  function rowsFromGvizTable(table) {
+    const cols = Array.isArray(table?.cols) ? table.cols : [];
+    const rows = Array.isArray(table?.rows) ? table.rows : [];
+    const headers = cols.map(col => headerKey(col.label || col.id || ''));
+    return rows.map(row => {
+      const obj = {};
+      headers.forEach((header, index) => {
+        const cell = row.c && row.c[index];
+        const value = cell ? (cell.f ?? cell.v ?? '') : '';
+        obj[header] = value == null ? '' : String(value);
+      });
+      return obj;
+    });
+  }
+  function applyLiveRows(rowObjects, sourceLabel) {
+    const liveRows = rowObjects.map(normalizeSheetRow).filter(Boolean);
+    if (!liveRows.length) throw new Error('No course rows found. Check the sheet headers and course rows.');
+    checklist = liveRows;
+    if (el.sheetStatus) el.sheetStatus.innerHTML = `<span class="sheet-status-box"><span class="ok">●</span><b>Live Google Sheet connected.</b> Showing ${liveRows.length} row${liveRows.length === 1 ? '' : 's'} from the online sheet via ${sourceLabel}.</span>`;
+  }
+  function loadSheetDataWithJsonp() {
+    return new Promise((resolve, reject) => {
+      const callbackName = '__emcSheetLoaded';
+      const oldScript = document.getElementById('emc-sheet-loader');
+      if (oldScript) oldScript.remove();
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Google Sheet connection timed out.'));
+      }, 12000);
+      function cleanup() {
+        clearTimeout(timer);
+        const script = document.getElementById('emc-sheet-loader');
+        if (script) script.remove();
+        try { delete window[callbackName]; } catch (error) { window[callbackName] = undefined; }
+      }
+      window[callbackName] = response => {
+        try {
+          if (!response || response.status === 'error') {
+            throw new Error(response?.errors?.[0]?.detailed_message || response?.errors?.[0]?.message || 'Google returned an error.');
+          }
+          applyLiveRows(rowsFromGvizTable(response.table), 'Google Visualization');
+          cleanup();
+          resolve();
+        } catch (error) {
+          cleanup();
+          reject(error);
+        }
+      };
+      const script = document.createElement('script');
+      script.id = 'emc-sheet-loader';
+      script.src = SHEET_GVIZ_URL + '&cacheBust=' + Date.now();
+      script.onerror = () => {
+        cleanup();
+        reject(new Error('Could not load the Google Sheet script feed.'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  async function loadSheetDataWithCsv() {
+    const response = await fetch(SHEET_CSV_URL + '&cacheBust=' + Date.now(), { cache: 'no-store' });
+    if (!response.ok) throw new Error('CSV HTTP ' + response.status);
+    const rows = parseCSV(await response.text());
+    const headers = (rows.shift() || []).map(headerKey);
+    const rowObjects = rows.map(cells => {
+      const row = {};
+      headers.forEach((header, index) => { row[header] = cells[index] || ''; });
+      return row;
+    });
+    applyLiveRows(rowObjects, 'CSV');
+  }
+  async function loadSheetData() {
+    if (el.sheetStatus) el.sheetStatus.innerHTML = `<span class="sheet-status-box"><span class="ok">●</span><b>Checking Google Sheet connection…</b></span>`;
+    try {
+      await loadSheetDataWithJsonp();
+    } catch (jsonpError) {
+      console.warn('Google Visualization load failed; trying CSV fallback.', jsonpError);
+      try {
+        await loadSheetDataWithCsv();
+      } catch (csvError) {
+        console.warn('Could not load Google Sheet. Using embedded fallback data.', csvError);
+        checklist = fallbackChecklist.slice();
+        const detail = csvError?.message || jsonpError?.message || 'Unknown connection error';
+        if (el.sheetStatus) el.sheetStatus.innerHTML = `<span class="sheet-status-box"><span class="warn">●</span><b>Google Sheet not connected.</b> Using embedded fallback data. Error: ${esc(detail)}</span>`;
+      }
+    }
+  }
   function areaOf(item) { return item['curriculum-area'] || ''; }
   function statusOf(item) {
     const s = String(item.status || '').toLowerCase();
@@ -227,6 +403,7 @@ body.dark .flowchart-stage { background:#f8fafc; }
     el.theme.querySelector('.theme-label').textContent = dark ? 'Light mode' : 'Dark mode';
   }
   function initAreas() {
+    el.area.innerHTML = '<option value="all">All curriculum areas</option>';
     const areas = unique(checklist.map(areaOf));
     areas.forEach(a => {
       const opt = document.createElement('option'); opt.value = a; opt.textContent = a; el.area.appendChild(opt);
@@ -424,8 +601,10 @@ body.dark .flowchart-stage { background:#f8fafc; }
   });
 
   applyTheme();
-  initAreas();
-  render();
+  loadSheetData().finally(() => {
+    initAreas();
+    render();
+  });
 })();
 </script>
 </body>
